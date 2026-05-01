@@ -187,6 +187,53 @@ async def collect_rollouts(sampler, tokenizer, batch: list[dict], args: argparse
     }
 
 
+async def train(
+    training_client,
+    tokenizer,
+    train_dataset: list[dict],
+    args: argparse.Namespace,
+) -> int:
+    total_steps = args.epochs * math.ceil(len(train_dataset) / args.prompt_batch_size)
+
+    print("Start on-policy importance sampling RL training")
+    for step, (epoch, batch_start, batch) in enumerate(
+        iter_batches(train_dataset, args.prompt_batch_size, args.epochs)
+    ):
+        sampler = await training_client.save_weights_and_get_sampling_client_async(
+            name=f"{args.swanlab_experiment}-step{step}"
+        )
+
+        datums, rollout_stats = await collect_rollouts(sampler, tokenizer, batch, args)
+
+        skipped = not datums
+        if skipped:
+            loss_sum = 0.0
+        else:
+            fwdbwd_future = await training_client.forward_backward_async(datums, "importance_sampling")
+            optim_future = await training_client.optim_step_async(
+                trio.AdamParams(learning_rate=args.learning_rate)
+            )
+            fwdbwd_result, _ = await asyncio.gather(fwdbwd_future, optim_future)
+            loss_sum = float(fwdbwd_result.metrics["loss:sum"])
+
+        swanlab.log({
+            **{f"train/{key}": value for key, value in rollout_stats.items()},
+            "train/loss_sum": loss_sum,
+            "train/skipped": skipped,
+            "epoch": epoch,
+            "batch_start": batch_start,
+        }, step=step)
+        print(
+            f"Step {step + 1}/{total_steps} | Epoch {epoch + 1} | "
+            f"Reward {rollout_stats['reward_mean']:.3f} | "
+            f"Acc {rollout_stats['accuracy']:.3f} | "
+            f"Samples {rollout_stats['valid_samples']} | "
+            f"LossSum {loss_sum:.3f}"
+        )
+
+    return total_steps
+
+
 async def evaluate(
     name: str,
     sampler,
@@ -241,15 +288,19 @@ async def evaluate(
 
 
 async def main():
+    # 解析命令行参数
     args = parse_args()
 
+    # 连接 TRIO 服务
     print("Connecting to TRIO service...")
     service_client = trio.ServiceClient()
 
+    # 加载 GSM8K 数据集
     print("Loading GSM8K dataset...")
     gsm8k = load_dataset(args.dataset_path, args.dataset_config)
     eval_dataset = list(gsm8k["test"])[: args.eval_samples]
 
+    # 仅评估模式：不训练，直接评估指定模型
     if args.eval_model_path:
         eval_sampler = await service_client.create_sampling_client_async(
             base_model=args.base_model,
@@ -258,60 +309,26 @@ async def main():
         await evaluate("eval", eval_sampler, eval_sampler.get_tokenizer(), eval_dataset, args)
         return
 
+    # 创建 LoRA 训练客户端
     training_client = await service_client.create_lora_training_client_async(
         base_model=args.base_model,
         rank=args.lora_rank,
     )
     tokenizer = training_client.get_tokenizer()
-
     train_dataset = list(gsm8k["train"])[: args.train_samples]
     total_steps = args.epochs * math.ceil(len(train_dataset) / args.prompt_batch_size)
 
+    # 初始化 SwanLab 实验追踪
     swanlab.init(
         project=args.swanlab_project,
         experiment_name=args.swanlab_experiment,
         config=vars(args) | {"loss_fn": "importance_sampling", "total_steps": total_steps},
     )
 
-    print("Start on-policy importance sampling RL training")
-    for step, (epoch, batch_start, batch) in enumerate(
-        iter_batches(train_dataset, args.prompt_batch_size, args.epochs)
-    ):
-        # 1. 用当前训练权重创建 sampler；这是 on-policy 训练的关键。
-        sampler = await training_client.save_weights_and_get_sampling_client_async(
-            name=f"{args.swanlab_experiment}-step{step}"
-        )
+    # 执行强化学习训练
+    total_steps = await train(training_client, tokenizer, train_dataset, args)
 
-        # 2. 用当前 sampler 采样，并转成 importance_sampling 所需的 Datum。
-        datums, rollout_stats = await collect_rollouts(sampler, tokenizer, batch, args)
-
-        # 3. TRIO 服务端计算 loss 和梯度，再执行优化；loss:sum 直接来自返回 metrics。
-        skipped = not datums
-        if skipped:
-            loss_sum = 0.0
-        else:
-            fwdbwd_future = await training_client.forward_backward_async(datums, "importance_sampling")
-            optim_future = await training_client.optim_step_async(
-                trio.AdamParams(learning_rate=args.learning_rate)
-            )
-            fwdbwd_result, _ = await asyncio.gather(fwdbwd_future, optim_future)
-            loss_sum = float(fwdbwd_result.metrics["loss:sum"])
-
-        swanlab.log({
-            **{f"train/{key}": value for key, value in rollout_stats.items()},
-            "train/loss_sum": loss_sum,
-            "train/skipped": skipped,
-            "epoch": epoch,
-            "batch_start": batch_start,
-        }, step=step)
-        print(
-            f"Step {step + 1}/{total_steps} | Epoch {epoch + 1} | "
-            f"Reward {rollout_stats['reward_mean']:.3f} | "
-            f"Acc {rollout_stats['accuracy']:.3f} | "
-            f"Samples {rollout_stats['valid_samples']} | "
-            f"LossSum {loss_sum:.3f}"
-        )
-
+    # 训练完成后，评估基座模型和 RL 微调后的模型
     print("Start Evaluation on GSM8K Test Set")
     base_sampler = await service_client.create_sampling_client_async(
         base_model=args.base_model
@@ -322,6 +339,7 @@ async def main():
     base_metrics = await evaluate("base", base_sampler, tokenizer, eval_dataset, args)
     rl_metrics = await evaluate("rl", rl_sampler, tokenizer, eval_dataset, args)
 
+    # 记录最终评估结果到 SwanLab
     swanlab.log({
         "eval/base_accuracy": base_metrics["accuracy"],
         "eval/rl_accuracy": rl_metrics["accuracy"],
