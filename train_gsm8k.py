@@ -99,7 +99,7 @@ def make_datum(
     tokens = prompt_tokens + completion_tokens
 
     # prompt 只作为上下文，不参与 loss；completion token 才使用 advantage 训练。
-    weights = ([0.0] * len(prompt_tokens) + [1.0] * len(completion_tokens))[1:]
+    weights = ([0.0] * len(prompt_tokens) + [1.0] * len(completion_tokens))
     advantages = [advantage * weight for weight in weights]
 
     # importance sampling 需要旧策略采样时的 logprob；prompt 部分补 0 并由 weights 屏蔽。
@@ -109,10 +109,9 @@ def make_datum(
     return trio.Datum(
         model_input=trio.ModelInput.from_ints(tokens=tokens[:-1]),
         loss_fn_inputs={
-            "weights": weights,
             "target_tokens": tokens[1:],
             "logprobs": old_logprobs[1:],
-            "advantages": advantages,
+            "advantages": advantages[1:],
         },
     )
 
@@ -139,28 +138,32 @@ async def sample_one_question(sampler, tokenizer, item: dict, args: argparse.Nam
 
     gold = gold_answer(item["answer"])
     completions = []
+    completion_lens = []
     for sequence in sample_result.sequences:
         completion_tokens = list(sequence.tokens)
         reward = reward_fn(sequence.text, gold)
         pred = parse_model_answer(sequence.text)
         is_correct = pred is not None and abs(pred - gold) < 1e-6
         completions.append((completion_tokens, sequence.logprobs, reward, is_correct))
+        completion_lens.append(len(completion_tokens))
 
-    rewards = [reward for _, _, reward, _ in completions]
-    advantages = group_advantages(rewards)
+    rewards = []
+    corrects = []
     datums = []
-    for (completion_tokens, logprobs, _, _), advantage in zip(completions, advantages):
+    for (completion_tokens, logprobs, reward, is_correct), advantage in zip(completions, advantages):
         datum = make_datum(prompt_tokens, completion_tokens, logprobs, advantage)
         if datum is not None:
             datums.append(datum)
-
-    correct = sum(is_correct for _, _, _, is_correct in completions)
+            rewards.append(reward)
+            corrects.append(is_correct)
+    advantages = group_advantages(rewards)
+    correct = sum(corrects)
     return {
         "datums": datums,
         "rewards": rewards,
         "advantages": advantages,
         "correct": correct,
-        "total": len(completions),
+        "comp_len": completion_lens,
     }
 
 
@@ -175,7 +178,7 @@ async def collect_rollouts(sampler, tokenizer, batch: list[dict], args: argparse
     rewards = [reward for result in results for reward in result["rewards"]]
     advantages = [adv for result in results for adv in result["advantages"]]
     correct = sum(result["correct"] for result in results)
-    total = sum(result["total"] for result in results)
+    completion_lens = [comp_len for result in results for comp_len in result["comp_len"]]
 
     return datums, {
         "reward_mean": float(np.mean(rewards)) if rewards else 0.0,
@@ -183,7 +186,9 @@ async def collect_rollouts(sampler, tokenizer, batch: list[dict], args: argparse
         "advantage_std": float(np.std(advantages)) if advantages else 0.0,
         "accuracy": correct / max(total, 1),
         "valid_samples": len(datums),
-        "total_rollouts": total,
+        "completion_len_avg": float(np.mean(completion_lens)),
+        "completion_len_std": float(np.std(completion_lens)),
+        "batch_tokens": sum(completion_lens),
     }
 
 
@@ -215,10 +220,11 @@ async def train(
             )
             fwdbwd_result, _ = await asyncio.gather(fwdbwd_future, optim_future)
             loss_sum = float(fwdbwd_result.metrics["loss:sum"])
+            loss = loss_sum / rollout_stats["batch_tokens"]
 
         swanlab.log({
-            **{f"train/{key}": value for key, value in rollout_stats.items()},
-            "train/loss_sum": loss_sum,
+            **{f"rollout/{key}": value for key, value in rollout_stats.items()},
+            "train/loss": loss,
             "train/skipped": skipped,
             "epoch": epoch,
             "batch_start": batch_start,
@@ -228,7 +234,7 @@ async def train(
             f"Reward {rollout_stats['reward_mean']:.3f} | "
             f"Acc {rollout_stats['accuracy']:.3f} | "
             f"Samples {rollout_stats['valid_samples']} | "
-            f"LossSum {loss_sum:.3f}"
+            f"Loss {loss:.3f}"
         )
 
     return total_steps
