@@ -181,11 +181,14 @@ async def collect_rollouts(sampler, tokenizer, batch: list[dict], args: argparse
     correct = sum(result["correct"] for result in results)
     completion_lens = [comp_len for result in results for comp_len in result["comp_len"]]
 
+    if not datums:
+        print("No valid datums, skip this batch")
+        return [], {}
     return datums, {
-        "reward_mean": float(np.mean(rewards)) if rewards else 0.0,
-        "reward_std": float(np.std(rewards)) if rewards else 0.0,
-        "advantage_std": float(np.std(advantages)) if advantages else 0.0,
-        "accuracy": correct / len(datums) if datums else 1.0,
+        "reward_mean": float(np.mean(rewards)),
+        "reward_std": float(np.std(rewards)),
+        "advantage_std": float(np.std(advantages)),
+        "accuracy": correct / len(datums),
         "completion_len_avg": float(np.mean(completion_lens)),
         "completion_len_std": float(np.std(completion_lens)),
         "batch_tokens": sum(completion_lens),
@@ -207,25 +210,19 @@ async def train(
         sampler = await training_client.save_weights_and_get_sampling_client_async(
             name=f"{args.swanlab_experiment}-step{step}"
         )
-
         datums, rollout_stats = await collect_rollouts(sampler, tokenizer, batch, args)
-
-        skipped = not datums
-        if skipped:
-            loss_sum = 0.0
-        else:
-            fwdbwd_future = await training_client.forward_backward_async(datums, "importance_sampling")
-            optim_future = await training_client.optim_step_async(
-                trio.AdamParams(learning_rate=args.learning_rate)
-            )
-            fwdbwd_result, _ = await asyncio.gather(fwdbwd_future, optim_future)
-            loss_sum = float(fwdbwd_result.metrics["loss:sum"])
-            loss = loss_sum / rollout_stats["batch_tokens"]
+        if not datums:
+            continue
+        fwdbwd_future = await training_client.forward_backward_async(datums, "importance_sampling")
+        optim_future = await training_client.optim_step_async(
+            trio.AdamParams(learning_rate=args.learning_rate)
+        )
+        fwdbwd_result, _ = await asyncio.gather(fwdbwd_future, optim_future)
+        loss = float(fwdbwd_result.metrics["loss:sum"]) / rollout_stats["batch_tokens"]
 
         swanlab.log({
-            **{f"rollout/{key}": value for key, value in rollout_stats.items()},
             "train/loss": loss,
-            "train/skipped": skipped,
+            **{f"rollout/{key}": value for key, value in rollout_stats.items()},
             "epoch": epoch,
             "batch_start": batch_start,
         }, step=step)
