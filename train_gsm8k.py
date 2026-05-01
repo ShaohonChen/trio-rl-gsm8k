@@ -16,7 +16,7 @@ import numpy as np
 import pytrio as trio
 import swanlab
 from datasets import load_dataset
-
+from tqdm.asyncio import tqdm_asyncio
 
 ANSWER_RE = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")
 NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
@@ -139,24 +139,25 @@ async def sample_one_question(sampler, tokenizer, item: dict, args: argparse.Nam
     gold = gold_answer(item["answer"])
     completions = []
     completion_lens = []
+    rewards=[]
     for sequence in sample_result.sequences:
         completion_tokens = list(sequence.tokens)
         reward = reward_fn(sequence.text, gold)
         pred = parse_model_answer(sequence.text)
         is_correct = pred is not None and abs(pred - gold) < 1e-6
-        completions.append((completion_tokens, sequence.logprobs, reward, is_correct))
+        completions.append((completion_tokens, sequence.logprobs, is_correct))
         completion_lens.append(len(completion_tokens))
+        rewards.append(reward)
 
-    rewards = []
+    advantages = group_advantages(rewards)
     corrects = []
     datums = []
-    for (completion_tokens, logprobs, reward, is_correct), advantage in zip(completions, advantages):
+    for (completion_tokens, logprobs, is_correct), advantage in zip(completions, advantages):
         datum = make_datum(prompt_tokens, completion_tokens, logprobs, advantage)
         if datum is not None:
             datums.append(datum)
-            rewards.append(reward)
             corrects.append(is_correct)
-    advantages = group_advantages(rewards)
+    
     correct = sum(corrects)
     return {
         "datums": datums,
@@ -184,8 +185,7 @@ async def collect_rollouts(sampler, tokenizer, batch: list[dict], args: argparse
         "reward_mean": float(np.mean(rewards)) if rewards else 0.0,
         "reward_std": float(np.std(rewards)) if rewards else 0.0,
         "advantage_std": float(np.std(advantages)) if advantages else 0.0,
-        "accuracy": correct / max(total, 1),
-        "valid_samples": len(datums),
+        "accuracy": correct / len(datums) if datums else 1.0,
         "completion_len_avg": float(np.mean(completion_lens)),
         "completion_len_std": float(np.std(completion_lens)),
         "batch_tokens": sum(completion_lens),
@@ -233,7 +233,7 @@ async def train(
             f"Step {step + 1}/{total_steps} | Epoch {epoch + 1} | "
             f"Reward {rollout_stats['reward_mean']:.3f} | "
             f"Acc {rollout_stats['accuracy']:.3f} | "
-            f"Samples {rollout_stats['valid_samples']} | "
+            f"Batch {len(datums)} | "
             f"Loss {loss:.3f}"
         )
 
@@ -265,7 +265,7 @@ async def evaluate(
 
     # 第一层 gather 并发提交 sample_async，第二层 gather 并发等待 TRIO 生成完成。
     sample_futures = await asyncio.gather(*sample_calls)
-    sample_results = await asyncio.gather(*sample_futures)
+    sample_results = await tqdm_asyncio.gather(*sample_futures, desc="Evaluating")
 
     correct = 0
     for (question, gold), sample_result in zip(examples, sample_results):
