@@ -18,9 +18,6 @@ import swanlab
 from datasets import load_dataset
 from tqdm.asyncio import tqdm_asyncio
 
-ANSWER_RE = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")
-NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -31,7 +28,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-path", default="./gsm8k", help="本地 GSM8K 数据集路径")
     parser.add_argument("--dataset-config", default="main", help="datasets.load_dataset 使用的数据配置名")
     parser.add_argument("--lora-rank", type=int, default=32, help="LoRA rank")
-    parser.add_argument("--epochs", type=int, default=2, help="遍历训练子集的轮数")
+    parser.add_argument("--epochs", type=int, default=1, help="遍历训练子集的轮数")
     parser.add_argument("--train-samples", type=int, default=512, help="用于训练的 GSM8K 样本数")
     parser.add_argument("--eval-samples", type=int, default=128, help="用于最终评估的 GSM8K 样本数")
     parser.add_argument("--prompt-batch-size", type=int, default=8, help="每个 RL step 采样多少道题")
@@ -40,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.7, help="训练采样温度")
     parser.add_argument("--learning-rate", type=float, default=1e-5, help="AdamW 学习率")
     parser.add_argument("--sampling-seed", type=int, default=None, help="训练采样随机种子；None 表示不固定")
-    parser.add_argument("--eval", dest="eval_model_path", default=None, help="输入评估模型路径，不执行训练")
+    parser.add_argument("--eval", dest="eval_model_path", default=None, help="仅评估模式，输入sample路径")
     parser.add_argument("--checkpoint-prefix", default="rl-gsm8k", help="TRIO 保存 sampler 权重时使用的前缀")
     parser.add_argument("--swanlab-project", default="GSM8K-WITH-TRIO", help="SwanLab 项目名")
     parser.add_argument("--swanlab-experiment", default="rl-gsm8k", help="SwanLab 实验名")
@@ -61,6 +58,8 @@ def gold_answer(answer: str) -> float:
 
 def parse_model_answer(text: str) -> float | None:
     """优先解析 #### 后的最终答案；没有时退回到最后一个数字。"""
+    ANSWER_RE = re.compile(r"####\s*(-?\d+(?:\.\d+)?)")
+    NUMBER_RE = re.compile(r"-?\d+(?:\.\d+)?")
     clean = text.replace(",", "")
     match = ANSWER_RE.search(clean)
     if match:
@@ -74,7 +73,7 @@ def reward_fn(text: str, gold: float) -> float:
     pred = parse_model_answer(text)
     if pred is None:
         return -1.0
-    return 2.0 if abs(pred - gold) < 1e-6 else -0.5
+    return 1.0 if abs(pred - gold) < 1e-6 else -0.5
 
 
 def group_advantages(rewards: list[float]) -> list[float]:
@@ -191,7 +190,7 @@ async def collect_rollouts(sampler, tokenizer, batch: list[dict], args: argparse
         "accuracy": correct / len(datums),
         "completion_len_avg": float(np.mean(completion_lens)),
         "completion_len_std": float(np.std(completion_lens)),
-        "batch_tokens": sum(completion_lens),
+        "batch_train_tokens": sum(completion_lens),
     }
 
 
@@ -218,7 +217,7 @@ async def train(
             trio.AdamParams(learning_rate=args.learning_rate)
         )
         fwdbwd_result, _ = await asyncio.gather(fwdbwd_future, optim_future)
-        loss = float(fwdbwd_result.metrics["loss:sum"]) / rollout_stats["batch_tokens"]
+        loss = float(fwdbwd_result.metrics["loss:sum"]) / rollout_stats["batch_train_tokens"]
 
         swanlab.log({
             "train/loss": loss,
