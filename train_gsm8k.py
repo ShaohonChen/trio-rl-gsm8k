@@ -11,6 +11,7 @@ import argparse
 import asyncio
 import math
 import re
+import time
 
 import numpy as np
 import pytrio as trio
@@ -30,13 +31,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-rank", type=int, default=32, help="LoRA rank")
     parser.add_argument("--epochs", type=int, default=1, help="遍历训练子集的轮数")
     parser.add_argument("--train-samples", type=int, default=512, help="用于训练的 GSM8K 样本数")
-    parser.add_argument("--eval-samples", type=int, default=128, help="用于最终评估的 GSM8K 样本数")
+    parser.add_argument("--eval-samples", type=int, default=256, help="用于最终评估的 GSM8K 样本数")
     parser.add_argument("--prompt-batch-size", type=int, default=8, help="每个 RL step 采样多少道题")
     parser.add_argument("--num-samples-per-prompt", type=int, default=4, help="每道题采样多少条回答")
     parser.add_argument("--max-tokens", type=int, default=512, help="单条回答最大生成 token 数")
     parser.add_argument("--temperature", type=float, default=0.7, help="训练采样温度")
     parser.add_argument("--learning-rate", type=float, default=1e-5, help="AdamW 学习率")
-    parser.add_argument("--sampling-seed", type=int, default=None, help="训练采样随机种子；None 表示不固定")
+    parser.add_argument("--seed", type=int, default=None, help="随机种子，默认 None 表示不固定")
     parser.add_argument("--eval", dest="eval_model_path", default=None, help="仅评估模式，输入sample路径")
     parser.add_argument("--checkpoint-prefix", default="rl-gsm8k", help="TRIO 保存 sampler 权重时使用的前缀")
     parser.add_argument("--swanlab-project", default="GSM8K-WITH-TRIO", help="SwanLab 项目名")
@@ -129,7 +130,7 @@ async def sample_one_question(sampler, tokenizer, item: dict, args: argparse.Nam
         sampling_params=trio.SamplingParams(
             max_tokens=args.max_tokens,
             temperature=args.temperature,
-            seed=args.sampling_seed,
+            seed=args.seed,
         ),
         num_samples=args.num_samples_per_prompt,
     )
@@ -201,11 +202,13 @@ async def train(
     args: argparse.Namespace,
 ) -> int:
     total_steps = args.epochs * math.ceil(len(train_dataset) / args.prompt_batch_size)
-
+    # cosine lr schedule
+    lr_schedule = lambda step: args.learning_rate * 0.5 * (1 + math.cos(math.pi * step / total_steps))
     print("Start on-policy importance sampling RL training")
     for step, (epoch, batch_start, batch) in enumerate(
         iter_batches(train_dataset, args.prompt_batch_size, args.epochs)
     ):
+        loop_start_time = time.time()
         sampler = await training_client.save_weights_and_get_sampling_client_async(
             name=f"{args.swanlab_experiment}-step{step}"
         )
@@ -213,24 +216,29 @@ async def train(
         if not datums:
             continue
         fwdbwd_future = await training_client.forward_backward_async(datums, "importance_sampling")
+        learning_rate=lr_schedule(step)
         optim_future = await training_client.optim_step_async(
-            trio.AdamParams(learning_rate=args.learning_rate)
+            trio.AdamParams(learning_rate=learning_rate)
         )
         fwdbwd_result, _ = await asyncio.gather(fwdbwd_future, optim_future)
         loss = float(fwdbwd_result.metrics["loss:sum"]) / rollout_stats["batch_train_tokens"]
-
+        loop_used_time = time.time() - loop_start_time
         swanlab.log({
             "train/loss": loss,
+            "train/learning_rate": learning_rate,
             **{f"rollout/{key}": value for key, value in rollout_stats.items()},
             "epoch": epoch,
             "batch_start": batch_start,
+            "loop_time": loop_used_time,
         }, step=step)
         print(
             f"Step {step + 1}/{total_steps} | Epoch {epoch + 1} | "
             f"Reward {rollout_stats['reward_mean']:.3f} | "
             f"Acc {rollout_stats['accuracy']:.3f} | "
             f"Batch {len(datums)} | "
-            f"Loss {loss:.3f}"
+            f"Learning Rate {learning_rate:.3e} | "
+            f"Loss {loss:.4f} | "
+            f"Loop Time {loop_used_time:.2f}"
         )
 
     return total_steps
@@ -245,22 +253,21 @@ async def evaluate(
 ) -> dict:
     """只评估一个模型：并发采样、解析答案、统计 accuracy。"""
     print(f"Evaluating {name} model...")
-    params = trio.SamplingParams(max_tokens=args.max_tokens, temperature=0.0, seed=42)
+    params = trio.SamplingParams(max_tokens=args.max_tokens, temperature=0.0, seed=args.seed)
 
     examples = []
-    sample_calls = []
+    sample_futures = []
     for item in eval_dataset:
         gold = gold_answer(item["answer"])
         prompt = trio.ModelInput.from_ints(
             tokenizer.encode(make_prompt(item["question"]), add_special_tokens=True)
         )
         examples.append((item["question"], gold))
-        sample_calls.append(
-            sampler.sample_async(prompt=prompt, sampling_params=params, num_samples=1)
+        sample_futures.append(
+            await sampler.sample_async(prompt=prompt, sampling_params=params, num_samples=1)
         )
 
     # 第一层 gather 并发提交 sample_async，第二层 gather 并发等待 TRIO 生成完成。
-    sample_futures = await asyncio.gather(*sample_calls)
     sample_results = await tqdm_asyncio.gather(*sample_futures, desc="Evaluating")
 
     correct = 0
@@ -269,23 +276,12 @@ async def evaluate(
         pred = parse_model_answer(text)
         is_correct = pred is not None and abs(pred - gold) < 1e-6
         correct += is_correct
-
-        print("=" * 80)
-        print(f"Model: {name}")
-        print(f"Q: {question}")
-        print(f"Gold: {gold}")
-        print(f"Pred: {repr(text.strip())} -> {pred}")
-        print(f"Correct: {is_correct}")
-
     total = len(eval_dataset)
     metrics = {
         "accuracy": correct / max(total, 1),
         "correct": correct,
         "total": total,
     }
-    print("=" * 80)
-    print(f"{name} Accuracy: {metrics['accuracy']:.4f} ({correct}/{total})")
-
     return metrics
 
 
@@ -315,31 +311,36 @@ async def main():
     training_client = await service_client.create_lora_training_client_async(
         base_model=args.base_model,
         rank=args.lora_rank,
+        seed=args.seed,
     )
     tokenizer = training_client.get_tokenizer()
     train_dataset = list(gsm8k["train"])[: args.train_samples]
-    total_steps = args.epochs * math.ceil(len(train_dataset) / args.prompt_batch_size)
-
     # 初始化 SwanLab 实验追踪
     swanlab.init(
         project=args.swanlab_project,
         experiment_name=args.swanlab_experiment,
-        config=vars(args) | {"loss_fn": "importance_sampling", "total_steps": total_steps},
+        config=vars(args) | {"loss_fn": "importance_sampling"},
     )
 
     # 执行强化学习训练
     total_steps = await train(training_client, tokenizer, train_dataset, args)
 
+    # 保存最终模型
+    print("Saving final model...")
+    rl_sampler_future = await training_client.save_weights_for_sampler_async(name=f"{args.checkpoint_prefix}-final")
+    rl_sampler_result = await rl_sampler_future
+    print(f"Final model saved to: {rl_sampler_result.path}")
     # 训练完成后，评估基座模型和 RL 微调后的模型
     print("Start Evaluation on GSM8K Test Set")
     base_sampler = await service_client.create_sampling_client_async(
         base_model=args.base_model
     )
-    rl_sampler = await training_client.save_weights_and_get_sampling_client_async(
-        name=f"{args.checkpoint_prefix}-final"
-    )
+    rl_sampler = await training_client.create_sampling_client_async(model_path=rl_sampler_result.path)
     base_metrics = await evaluate("base", base_sampler, tokenizer, eval_dataset, args)
     rl_metrics = await evaluate("rl", rl_sampler, tokenizer, eval_dataset, args)
+    print("=" * 80)
+    print(f"Base Model Accuracy: {base_metrics['accuracy']:.4f} ({base_metrics['correct']}/{base_metrics['total']})")
+    print(f"RL Model Accuracy: {rl_metrics['accuracy']:.4f} ({rl_metrics['correct']}/{rl_metrics['total']})")
 
     # 记录最终评估结果到 SwanLab
     swanlab.log({
