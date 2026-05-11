@@ -304,7 +304,8 @@ async def main():
             base_model=args.base_model,
             model_path=args.eval_model_path,
         )
-        await evaluate("eval", eval_sampler, eval_sampler.get_tokenizer(), eval_dataset, args)
+        eval_metrics = await evaluate("eval", eval_sampler, eval_sampler.get_tokenizer(), eval_dataset, args)
+        print(f"Evaluation Accuracy: {eval_metrics['accuracy']:.4f} ({eval_metrics['correct']}/{eval_metrics['total']})")
         return
 
     # 创建 LoRA 训练客户端
